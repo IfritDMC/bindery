@@ -1,0 +1,114 @@
+name: Build multilingual candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Stable upstream tag to patch (blank selects the latest stable tag)"
+        required: false
+        type: string
+  schedule:
+    # Prepare a fresh candidate every Monday without touching production.
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: multilingual-candidate
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Apply multilingual search patch to stable upstream
+        id: prepare
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          git fetch https://github.com/vavallee/bindery.git \
+            '+refs/tags/*:refs/tags/*'
+          git fetch origin codex/multilingual-title-search
+          patch_sha="$(git rev-parse FETCH_HEAD)"
+
+          upstream_tag="$REQUESTED_TAG"
+          if [ -z "$upstream_tag" ]; then
+            upstream_tag="$(
+              git tag --list \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1
+            )"
+          fi
+          test -n "$upstream_tag"
+          git rev-parse --verify "refs/tags/$upstream_tag"
+
+          git checkout --detach "$upstream_tag"
+          git -c user.name=IfritDMC \
+              -c user.email=36554827+IfritDMC@users.noreply.github.com \
+              cherry-pick "$patch_sha"
+
+          image_version="${upstream_tag}-alias1"
+          image_tag="candidate-${upstream_tag}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          patched_sha="$(git rev-parse HEAD)"
+
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "image_version=$image_version" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "build_date=$build_date" >> "$GITHUB_OUTPUT"
+          echo "patched_sha=$patched_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish candidate
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          tags: |
+            ghcr.io/ifritdmc/bindery:candidate
+            ghcr.io/ifritdmc/bindery:${{ steps.prepare.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/IfritDMC/bindery
+            org.opencontainers.image.revision=${{ steps.prepare.outputs.patched_sha }}
+            org.opencontainers.image.version=${{ steps.prepare.outputs.image_version }}
+          build-args: |
+            VERSION=${{ steps.prepare.outputs.image_version }}
+            COMMIT=${{ steps.prepare.outputs.patched_sha }}
+            BUILD_DATE=${{ steps.prepare.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write promotion summary
+        run: |
+          {
+            echo "## Candidate ready"
+            echo
+            echo "- Upstream: \`${{ steps.prepare.outputs.upstream_tag }}\`"
+            echo "- Image: \`ghcr.io/ifritdmc/bindery:${{ steps.prepare.outputs.image_tag }}\`"
+            echo "- Mutable alias: \`ghcr.io/ifritdmc/bindery:candidate\`"
+            echo "- Production was not changed; promote this image manually after validation."
+          } >> "$GITHUB_STEP_SUMMARY"
